@@ -1,4 +1,4 @@
-"""Usage: python main.py fetch | evening | live | report | backtest | train | dash
+"""Usage: python main.py fetch | evening | live | report | backtest | train | dash | widget
        python main.py fund 5000 [note]    add money (negative number = withdraw)
        python main.py balance             balance, deposits, P&L
        python main.py statement [YYYY-MM-DD]   trade-by-trade statement for a day"""
@@ -118,6 +118,16 @@ def readiness(c, cfg):
     return report.render(report.stats(db.closed_trades(c, cfg["rule_version"]), cfg), cfg)
 
 
+def live_ran_on_time(day):
+    """True only if the live engine started by 09:25 (before the first trigger bar) on `day`.
+    If it did not, the evening replay would be hindsight, so no trades may be recorded for that day."""
+    try:
+        t = pd.Timestamp(open(f"data/live_start_{day}.txt").read().strip())
+    except Exception:
+        return False
+    return t.time() <= dtime(9, 25)
+
+
 def tick(c, picks, cfg, today, now):
     import data
     bars = {s: data.fetch(s, "5m", "5d") for s in picks}
@@ -165,6 +175,9 @@ def live(cfg):
         return notify.send("No picks stored for today. Did the evening run happen?")
     dcfg = day_cfg(c, today, cfg)
     notify.send(f"Watching today: {', '.join(picks)}  (capital Rs {dcfg['capital']:,.0f}, risk/trade Rs {dcfg['risk_per_trade']:,.0f})")
+    marker = f"data/live_start_{today}.txt"                  # first start of the day only; evening checks it
+    if not os.path.exists(marker):
+        open(marker, "w").write(str(now_ist()))
     failing, last_slot = False, None
     while now_ist().time() < dtime(15, 20):
         now = now_ist()
@@ -208,21 +221,28 @@ def _safe(msg, fn):
 def evening(cfg):
     import data, ml, picker
     today, c = now_ist().date(), db.connect()
-    fetch_all(cfg)
+    fetch_all(cfg)                                       # data storing: always runs, unchanged (feeds weekly ML training)
     msg = []
     picks = db.picks_for(c, today)
     if is_trading_day(today, cfg) and picks:
-        bars5 = {s: data.load(s, "5m") for s in picks}
-        bars1 = {s: data.load(s, "1m") for s in picks}
-        trades, notes = engine.run_day(today, picks, bars5, day_cfg(c, today, cfg), data.load("NIFTY", "5m"), bars1)
-        for tr in trades:
-            tr["dq"] = (tr["dq"] + " " + data.quality(bars5[tr["symbol"]], today)).strip()
-        db.delete_day(c, today)                          # evening data replaces the live-mode log
-        db.save_trades(c, trades)
-        db.mark_picks(c, today, trades, notes)
-        msg.append(f"Today: {len(trades)} trades, net Rs {sum(t['net'] or 0 for t in trades):.2f}")
-        msg += [f"  {s}: {n}" for s, n in notes.items() if n != "traded"]
-        _safe(msg, lambda: ml.after_settle(cfg, c, today, trades))
+        if live_ran_on_time(today):
+            bars5 = {s: data.load(s, "5m") for s in picks}
+            bars1 = {s: data.load(s, "1m") for s in picks}
+            trades, notes = engine.run_day(today, picks, bars5, day_cfg(c, today, cfg), data.load("NIFTY", "5m"), bars1)
+            for tr in trades:
+                tr["dq"] = (tr["dq"] + " " + data.quality(bars5[tr["symbol"]], today)).strip()
+            db.delete_day(c, today)                      # evening data replaces the live-mode log
+            db.save_trades(c, trades)
+            db.mark_picks(c, today, trades, notes)
+            msg.append(f"Today: {len(trades)} trades, net Rs {sum(t['net'] or 0 for t in trades):.2f}")
+            msg += [f"  {s}: {n}" for s, n in notes.items() if n != "traded"]
+            _safe(msg, lambda: ml.after_settle(cfg, c, today, trades))
+        else:
+            # live did not run from the open: a replay would be hindsight, so NO trades are written.
+            # Bars are already saved above; shadow rows still get logged for the weekly ML training.
+            msg.append("Live engine did not run from the open today: no trades recorded "
+                       "(a replay would be hindsight). Bars and tomorrow's picks are still saved.")
+            _safe(msg, lambda: ml.after_settle(cfg, c, today, []))
     if is_trading_day(today, cfg):
         stmt = statement(c, cfg, today)
         os.makedirs("data/statements", exist_ok=True)
@@ -268,5 +288,5 @@ if __name__ == "__main__":
     cfg = json.load(open("config.json"))
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     {"fetch": fetch_all, "train": train, "evening": evening, "live": live, "backtest": backtest,
-     "dash": lambda cfg: __import__("dashboard").serve(cfg), "fund": fund, "balance": balance, "statement": show_statement,
+     "dash": lambda cfg: __import__("dashboard").serve(cfg), "widget": lambda cfg: __import__("dashboard").widget(cfg), "fund": fund, "balance": balance, "statement": show_statement,
      "report": lambda cfg: print(readiness(db.connect(), cfg))}.get(cmd, lambda cfg: print(__doc__))(cfg)
