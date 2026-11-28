@@ -75,6 +75,7 @@ def simulate_day(df5, day, cfg, nifty=None, df1=None, now=None, prepped=False):
     mid = (orh + orl) / 2
     nret = _nifty_ret(nifty, day)
     pos = {ts: i for i, ts in enumerate(t.index)}
+    last_skip = None            # v4: reason of the last skipped trigger, used when retry_after_skip is on
 
     for ts, r in t.between_time(cfg.get("first_trigger_bar", "09:30"), cfg["last_trigger_bar"]).iterrows():
         if not done(ts):
@@ -93,8 +94,12 @@ def simulate_day(df5, day, cfg, nifty=None, df1=None, now=None, prepped=False):
         i = pos[ts]
         if i + 1 >= len(t):
             return None, "triggered, waiting for entry bar"
-        return _trade(t, i, side, r, orh, orl, mid, gap, n, cfg, df1, now, done)
-    return None, "no trigger"
+        res = _trade(t, i, side, r, orh, orl, mid, gap, n, cfg, df1, now, done)
+        if res[0] is None and res[1].startswith("skipped") and cfg.get("retry_after_skip", False):
+            last_skip = res[1]                     # cost gate or qty 0 rejected this trigger: keep scanning
+            continue
+        return res
+    return None, last_skip or "no trigger"
 
 
 def _trade(t, i, side, r, orh, orl, mid, gap, nret, cfg, df1, now, done):

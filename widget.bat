@@ -1,3 +1,3 @@
 @echo off
 cd /d "%~dp0"
-start "" pythonw main.py widget
+start "" ".venv\Scripts\pythonw.exe" main.py widget

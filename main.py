@@ -1,7 +1,8 @@
 """Usage: python main.py fetch | evening | live | report | backtest | train | dash | widget
        python main.py fund 5000 [note]    add money (negative number = withdraw)
        python main.py balance             balance, deposits, P&L
-       python main.py statement [YYYY-MM-DD]   trade-by-trade statement for a day"""
+       python main.py statement [YYYY-MM-DD]   trade-by-trade statement for a day
+       python main.py maxtrades [N]       show or change the max trades per day (also on the dashboard; applies from the next live start)"""
 import json
 import os
 import sys
@@ -83,16 +84,14 @@ def fund(cfg):
     args = sys.argv[2:]
     if not args:
         return print("Usage: python main.py fund 5000 [note]   (negative amount = withdraw)")
-    amt, note = float(args[0]), " ".join(args[1:])
-    c, now = db.connect(), now_ist()
-    today = now.date()
-    eff = today if is_trading_day(today, cfg) and now.time() < dtime(8, 45) else next_trading_day(today, cfg)
-    if equity_at(c, eff, cfg) + amt < 0:
-        return print(f"Refused: balance would go below zero (balance Rs {equity_at(c, eff, cfg):,.2f}).")
-    db.add_fund(c, eff, amt, note)
-    after = day_cfg(c, eff, cfg)
-    print(f"{'Added' if amt > 0 else 'Withdrew'} Rs {abs(amt):,.2f}. Effective from trading day {eff} (before that day's open).")
-    print(f"Balance at the start of {eff}: Rs {after['capital']:,.2f}, risk per trade Rs {after['risk_per_trade']:,.2f}")
+    import funds
+    ok, msg, eff = funds.add(cfg, args[0], " ".join(args[1:]))
+    print(msg)
+    if ok:
+        try:
+            print(funds.repick(cfg, eff))
+        except Exception as e:
+            print(f"Picks were not rebuilt ({e}); the evening run will use the new balance.")
 
 
 def balance(cfg):
@@ -112,6 +111,25 @@ def balance(cfg):
 def show_statement(cfg):
     day = date.fromisoformat(sys.argv[2]) if len(sys.argv) > 2 else now_ist().date()
     print(statement(db.connect(), cfg, day))
+
+
+def maxtrades(cfg):
+    """Show or change max_trades_per_day (same rules as the dashboard control; see limits.py)."""
+    import limits
+    args = sys.argv[2:]
+    if not args:
+        return print(f"Max trades per day: {limits.current()}  (change with: python main.py maxtrades N)")
+    try:
+        n = int(args[0])
+    except ValueError:
+        return print(f"Usage: python main.py maxtrades N   (a whole number from {limits.LOW} to {limits.HIGH})")
+    ok, msg, old, new = limits.set_max_trades(n)
+    print(msg)
+    if ok:
+        now = now_ist()
+        day = next_trading_day(now.date(), cfg) if now.time() >= dtime(15, 45) else now.date()
+        eq = max(equity_at(db.connect(), day, cfg), 0.0)
+        print(f"Each trade may now use at most balance / {new} = about Rs {eq / new:,.0f} (was about Rs {eq / old:,.0f}).")
 
 
 def readiness(c, cfg):
@@ -288,5 +306,5 @@ if __name__ == "__main__":
     cfg = json.load(open("config.json"))
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     {"fetch": fetch_all, "train": train, "evening": evening, "live": live, "backtest": backtest,
-     "dash": lambda cfg: __import__("dashboard").serve(cfg), "widget": lambda cfg: __import__("dashboard").widget(cfg), "fund": fund, "balance": balance, "statement": show_statement,
+     "dash": lambda cfg: __import__("dashboard").serve(cfg), "widget": lambda cfg: __import__("dashboard").widget(cfg), "fund": fund, "balance": balance, "statement": show_statement, "maxtrades": maxtrades,
      "report": lambda cfg: print(readiness(db.connect(), cfg))}.get(cmd, lambda cfg: print(__doc__))(cfg)
