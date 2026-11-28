@@ -1,6 +1,7 @@
 """v2: shadow trades + shadow models. The models only report; they never change live picks or trades."""
 import json
 import os
+from datetime import date
 
 import joblib
 import numpy as np
@@ -40,6 +41,49 @@ def shadow_build(cfg, c, only_day=None):
     return len(rows)
 
 
+# ---------------------------------------------------------------- on/off gate (REPORT ONLY: nothing in live uses it)
+GATE = "data/ml_gate.json"
+GATE_MIN_AUC_LO, GATE_MIN_TEST, GATE_MIN_KEPT, GATE_STREAK, GATE_SPAN_DAYS = 0.55, 300, 30, 3, 10
+
+
+def _auc_lo(y, p, n=300):
+    """5th percentile of the AUC over bootstrap resamples of the test trades (a pessimistic estimate)."""
+    rng, out = np.random.default_rng(0), []
+    for _ in range(n):
+        b = rng.integers(0, len(y), len(y))
+        if len(set(y[b])) == 2:
+            out.append(roc_auc_score(y[b], p[b]))
+    return float(np.percentile(out, 5)) if out else float("nan")
+
+
+def update_gate(auc, lo, n_test, n_kept, net_all, net_kept, today=None):
+    """Records this train run and returns (gate_on, reasons). On only after GATE_STREAK passing runs spread over
+    GATE_SPAN_DAYS+ days; off again as soon as AUC < 0.5 or the kept trades stop beating all trades (lower bar = no flip-flopping)."""
+    today = str(today or date.today())
+    h = json.load(open(GATE)) if os.path.exists(GATE) else {"on": False, "history": []}
+    why = []
+    if not lo >= GATE_MIN_AUC_LO:
+        why.append(f"AUC lower bound {lo:.2f} (need >= {GATE_MIN_AUC_LO})")
+    if n_test < GATE_MIN_TEST:
+        why.append(f"{n_test} test trades (need >= {GATE_MIN_TEST})")
+    if n_kept < GATE_MIN_KEPT:
+        why.append(f"{n_kept} model-kept trades (need >= {GATE_MIN_KEPT})")
+    if not net_kept > net_all:
+        why.append("model-kept trades do not beat all trades after costs")
+    rec = dict(date=today, auc=round(auc, 3), lo=round(lo, 3), n_test=int(n_test), passed=not why, why=why)
+    h["history"] = [x for x in h["history"] if x["date"] != today] + [rec]     # re-running on the same day counts once
+    h["history"] = h["history"][-12:]
+    last = h["history"][-GATE_STREAK:]
+    span = (date.fromisoformat(last[-1]["date"]) - date.fromisoformat(last[0]["date"])).days
+    if not h["on"] and len(last) == GATE_STREAK and all(x["passed"] for x in last) and span >= GATE_SPAN_DAYS:
+        h["on"] = True
+    elif h["on"] and (auc < 0.5 or not net_kept > net_all):
+        h["on"] = False
+    os.makedirs(os.path.dirname(GATE), exist_ok=True)
+    json.dump(h, open(GATE, "w"), indent=1)
+    return h["on"], why
+
+
 # ---------------------------------------------------------------- trade scorer
 def _trade_frame(rows):
     df = pd.DataFrame(rows)
@@ -68,16 +112,27 @@ def train_trade_scorer(cfg, c):
     p = m.predict_proba(X[te])[:, 1]
     net = df.net.values[te]
     risk, ch = df.risk_rs[tr].mean(), df.charges[tr].mean()
-    be = (risk + ch) / (risk * (1 + cfg["target_rr"]))
+    be = (risk + ch) / (risk * (1 + cfg["target_rr"]))                 # charges only (no slippage): optimistic
+    slip = df.slip_rs[tr].mean() if "slip_rs" in df else 0.0
+    be_slip = (risk + ch + slip) / (risk * (1 + cfg["target_rr"]))     # slippage makes a loss bigger and a win smaller (approximate)
     keep = p >= be + 0.05
     print(f"\n== Trade scorer (train {tr.sum()} trades before {cut}, test {te.sum()} after) ==")
     print(f"AUC {roc_auc_score(y[te], p):.3f} (0.5 = no skill)   Brier {brier_score_loss(y[te], p):.3f}")
-    print(f"test win rate {y[te].mean():.1%}, break-even {be:.1%}")
+    print(f"test win rate {y[te].mean():.1%}, break-even {be:.1%} (charges only) / {be_slip:.1%} (with slippage)")
+    if "exit_reason" in df:
+        tdf = df[te]
+        print("test exits: " + "  ".join(f"{k} {len(g)} (avg net {g.net.mean():+.2f}, 'wins' {(g.net > 0).mean():.0%})"
+                                         for k, g in tdf.groupby("exit_reason")))
     print(f"avg net/trade: all {net.mean():.2f}  |  model-kept ({keep.sum()} trades) "
           f"{net[keep].mean() if keep.any() else float('nan'):.2f}")
     cal = pd.DataFrame({"bin": pd.cut(p, [0, .4, .45, .5, .55, .6, 1.0]), "predicted": p, "actual": y[te]})
     print(cal.groupby("bin", observed=True).agg(n=("actual", "size"), predicted=("predicted", "mean"),
                                                 actual=("actual", "mean")).round(3).to_string())
+    lo = _auc_lo(y[te], p)
+    on, why = update_gate(roc_auc_score(y[te], p), lo, int(te.sum()), int(keep.sum()), float(net.mean()),
+                          float(net[keep].mean()) if keep.any() else float("nan"))
+    print(f"ML gate (report only, live trading ignores it): {'ON' if on else 'OFF - rules stay in charge'}"
+          + ("" if on else "; " + "; ".join(why)))
     hold = df.symbol.isin(sorted(df.symbol.unique())[::4]).values        # stocks the model never saw
     if hold.sum() >= 30 and (~hold).sum() >= 30 and len(set(y[hold])) == 2:
         mh = _clf().fit(X[~hold], y[~hold])

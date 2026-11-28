@@ -9,10 +9,14 @@ Look: Palomar-style cream / forest editorial theme with a video hero; light + da
 The page updates its data in place every 30 s (GET /data), so the video never restarts.
 Widget: python main.py widget -> small always-on-top desktop window (GET /widget) with the same theme + video; shows the
 watchlist, and switches to the live trades while the live engine is running and has trades.
+Account funds: the 'Account funds' card (amount, note, Add / Withdraw) posts to /fund (see funds.py), shows the deposit/withdrawal list,
+and rebuilds the next day's picks from the new balance.
+Max trades per day: the 'Max trades per day' card (stepper + Apply) edits config.json through POST /maxtrades (see limits.py).
 """
 import base64
 import json
 import os
+import sys
 import time
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -20,7 +24,13 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+for _n in ("stdout", "stderr"):                                  # pythonw has no console: yfinance's prints/progress bar then crash every fetch
+    if getattr(sys, _n) is None:
+        setattr(sys, _n, open(os.devnull, "w"))
+
 import db
+import funds as acct          # not `funds`: payload() has a local variable of that name
+import limits
 import report
 
 _px = {}
@@ -34,12 +44,19 @@ def bars(sym):
         return hit[1]
     try:
         import data
-        df = data.fetch(sym, "5m", "1d")
-        if not len(df):                                          # market closed / pre-open: show the last session instead
-            df = data.fetch(sym, "5m", "5d")
-            df = df[df.index.date == df.index[-1].date()] if len(df) else df
+        import engine
+        df = data.fetch(sym, "5m", "5d")                         # 5 days so ATR/RSI/rel-vol warm up exactly as in the live engine
+        if len(df):
+            try:
+                df = engine.prep(df)                             # same function the trading rules use (display only here)
+            except Exception:
+                pass
+            df = df[df.index.date == df.index[-1].date()]        # today, or the last session when the market is closed
         df = df if len(df) else None
     except Exception:
+        import traceback
+        with open("widget_error.log", "a") as f:                 # hidden (pythonw) runs have no console, so keep the reason here
+            f.write(f"{datetime.now():%H:%M:%S} {sym}\n{traceback.format_exc()}\n")
         df = None
     _bars[sym] = (time.time(), df)
     return df
@@ -154,6 +171,13 @@ h2 i{font-style:normal;letter-spacing:-.01em;text-transform:none;font-size:15px;
 .btn:hover{background:var(--hover)}
 .btn[aria-pressed=true]{color:var(--onink);background:var(--ink);border-color:var(--ink)}
 .btn:focus-visible,.tab:focus-visible,.seg a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.btn[disabled]{opacity:.4;cursor:not-allowed}.btn[disabled]:hover{background:transparent}
+.maxrow{display:flex;align-items:center;gap:16px;flex-wrap:wrap}.step{display:inline-flex;align-items:center;gap:10px}
+.step .btn{width:36px;padding:0;font-size:18px;line-height:1}.maxval{font-size:34px;letter-spacing:-.03em;min-width:2ch;text-align:center}
+.fundrow{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.fin{font:inherit;font-size:14px;min-height:36px;padding:6px 14px;border-radius:999px;color:var(--ink);background:transparent;border:1px solid var(--edge);flex:1 1 130px;min-width:0}
+.fin:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.msub{margin:10px 0 0;font-size:12px;color:var(--dim)}.msub:empty{display:none}
 .tip{position:absolute;left:0;top:0;will-change:transform;pointer-events:none;z-index:5;padding:9px 12px;border-radius:12px;font-size:11px;line-height:1.55;white-space:nowrap;
   background:var(--tipbg);color:var(--ink);border:1px solid var(--edge);box-shadow:0 6px 24px rgba(0,0,0,.18);opacity:0;transition:opacity .15s;font-variant-numeric:tabular-nums}
 .legend{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px;font-size:11px;color:var(--dim)}
@@ -161,6 +185,7 @@ h2 i{font-style:normal;letter-spacing:-.01em;text-transform:none;font-size:15px;
 .legend i{display:inline-block;width:18px;height:0;border-top:2px dashed}
 .cw{position:relative;height:440px}.cw.compact{height:270px}
 .cw canvas{width:100%;height:100%;display:block}.cw .ov{position:absolute;inset:0;cursor:crosshair}
+#iseg{display:inline-flex;gap:6px}
 .ctl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .seg{display:inline-flex;border:1px solid var(--edge);border-radius:999px;padding:3px;gap:2px}
 .seg a{display:inline-flex;align-items:center;min-height:30px;padding:0 14px;border-radius:999px;font-size:13px;color:var(--ink);text-decoration:none;transition:background .25s,color .25s}
@@ -203,6 +228,8 @@ tbody tr{transition:background .2s}tbody tr:hover{background:var(--hover)}
 .chip.watching{background:rgba(47,143,91,.16);color:var(--chipwatch)}
 .chip.extra{color:var(--dim)}
 .full{margin-bottom:20px}
+.mlrow{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;margin-top:10px;font-size:14px}
+.mlrow .chip{font-size:13px}
 pre{margin:0;padding:18px 20px;overflow-x:auto;background:var(--prebg);border:1px solid var(--line);border-radius:16px;color:var(--ink);font-family:ui-monospace,'SF Mono',Menlo,Consolas,monospace;font-size:12.5px;line-height:1.7}
 
 /* entrance (same easing + stagger as the Palomar page) */
@@ -254,7 +281,7 @@ var TH={};function readTheme(){var cs=getComputedStyle(root);['grid','label','cr
 
 /* ---------- data ---------- */
 var BARS={},DC={};
-function loadBars(){BARS={};DC={};Object.keys(D.bars).forEach(function(s){var b=D.bars[s];BARS[s]=b?b.t.map(function(_,i){return{o:b.o[i],h:b.h[i],l:b.l[i],c:b.c[i],v:b.v[i]}}):null})}
+function loadBars(){BARS={};DC={};Object.keys(D.bars).forEach(function(s){var b=D.bars[s];BARS[s]=b?b.t.map(function(_,i){return{o:b.o[i],h:b.h[i],l:b.l[i],c:b.c[i],v:b.v[i],a:b.a?b.a[i]:null,r:b.r?b.r[i]:null,q:b.q?b.q[i]:null}}):null})}
 loadBars();
 function tstr(sym,i){var t=D.bars[sym].t[0].split(':'),m=(+t[0])*60+(+t[1])+i*5;return pad(Math.floor(m/60)%24)+':'+pad(m%60)}
 function vwap(b){var pv=0,v=0,any=false,last=null;var out=b.map(function(x){var tp=(x.h+x.l+x.c)/3;pv+=tp*x.v;v+=x.v;if(x.v>0)any=true;if(v>0)last=pv/v;return last});return any?out:null}
@@ -273,6 +300,13 @@ function patterns(b){
 }
 function derived(sym){var c=DC[sym];if(!c){var b=BARS[sym];c=DC[sym]={vw:vwap(b),pats:patterns(b)}}return c}
 
+/* ---------- engine indicators under the chart (display only), each toggled by a button ---------- */
+var IP={rsi:{n:'RSI 14',k:'r',d:0},atr:{n:'ATR %',k:'a',d:2},rv:{n:'Rel vol',k:'q',d:2}},IK=['rsi','atr','rv'],IND={};
+try{IND=JSON.parse(localStorage.getItem('nseind'))||{}}catch(e){}
+function indOn(k){return IND[k]!==false}
+function panels(b){return IK.filter(function(k){return indOn(k)&&b.some(function(x){return x[IP[k].k]!=null})})}
+function indTip(x){return IK.filter(indOn).map(function(k){var v=x[IP[k].k];return v==null?'':'<br>'+IP[k].n+' '+IN(v,IP[k].d)}).join('')}
+
 /* ---------- formatting ---------- */
 var IN=function(v,d){return Number(v).toLocaleString('en-IN',{minimumFractionDigits:d,maximumFractionDigits:d})};
 function signed(v,d){return(v>0?'+':v<0?'\u2212':'')+IN(Math.abs(v),d==null?2:d)}
@@ -285,11 +319,54 @@ function table(head,rows,right){
   return '<div class="scroll"><table><thead><tr>'+head.map(function(h,i){return '<th'+(right.indexOf(i)>-1?' class="r"':'')+'>'+h+'</th>'}).join('')+'</tr></thead><tbody>'+
     rows.map(function(r){return '<tr>'+r.map(function(c,i){return '<td'+(right.indexOf(i)>-1?' class="r num"':'')+'>'+c+'</td>'}).join('')+'</tr>'}).join('')+'</tbody></table></div>'}
 
+/* ---------- max trades per day ---------- */
+var mxPending=null;
+function mxDraw(){
+  var sec=$('maxSec');
+  if(D.maxTrades==null){sec.style.display='none';return}
+  sec.style.display='';
+  var v=mxPending==null?D.maxTrades:mxPending,lo=D.maxRange[0],hi=D.maxRange[1],lock=!!D.maxLock;
+  $('mxVal').textContent=v;
+  $('mxDown').disabled=lock||v<=lo;$('mxUp').disabled=lock||v>=hi;$('mxSave').disabled=lock||v===D.maxTrades;
+  $('mxSub').innerHTML=lock?esc(D.maxLock):'Each trade may use up to about <b class="num">Rs '+IN(D.balance/v,0)+'</b> (balance &divide; '+v+'). Takes effect from the next live start.'}
+function mxStep(dx){var v=mxPending==null?D.maxTrades:mxPending;mxPending=Math.min(D.maxRange[1],Math.max(D.maxRange[0],v+dx));$('mxMsg').textContent='';mxDraw()}
+$('mxDown').addEventListener('click',function(){mxStep(-1)});
+$('mxUp').addEventListener('click',function(){mxStep(1)});
+$('mxSave').addEventListener('click',function(){
+  if(mxPending==null)return;
+  $('mxSave').disabled=true;
+  fetch('/maxtrades',{method:'POST',headers:{'Content-Type':'application/json','X-NSE':'1'},body:JSON.stringify({n:mxPending})})
+    .then(function(r){return r.json()}).then(function(j){
+      $('mxMsg').textContent=j.msg||'';
+      if(j.maxTrades!=null){D.maxTrades=j.maxTrades;D.maxLock=j.maxLock}
+      if(j.ok)mxPending=null;
+      mxDraw()}).catch(function(){$('mxMsg').textContent='Could not reach the dashboard server.';mxDraw()})});
+
+/* ---------- account funds ---------- */
+function fdDraw(){
+  var L=D.ledger||[],pend=D.fundsPending||0;
+  $('fdSub').innerHTML='Balance <b class="num">Rs '+IN(D.balance,2)+'</b>.'+(pend?' Pending from the next trading day: <b class="num">'+signed(pend,2)+'</b>.':'')+' The next picks are rebuilt from the new balance.';
+  $('fdBox').innerHTML=L.length?table(['Effective','Type','Amount','Note'],L.map(function(r){
+    return [esc(r.effective)+(r.pending?' <span class="dim">(pending)</span>':''),r.amount>0?'Deposit':'Withdrawal',money(r.amount),esc(r.note||'')]}),[2]):'<p class="dim">No deposits or withdrawals yet.</p>'}
+function fdSend(sign){
+  var amt=parseFloat($('fdAmt').value);
+  if(!isFinite(amt)||amt<=0){$('fdMsg').textContent='Enter an amount above 0, then choose Add money or Withdraw.';return}
+  $('fdAdd').disabled=true;$('fdWd').disabled=true;
+  $('fdMsg').textContent='Saving and rebuilding the next picks (can take up to a minute)\u2026';
+  fetch('/fund',{method:'POST',headers:{'Content-Type':'application/json','X-NSE':'1'},body:JSON.stringify({amount:sign*amt,note:$('fdNote').value})})
+    .then(function(r){return r.json()}).then(function(j){
+      $('fdMsg').textContent=j.msg||'';
+      if(j.ok){$('fdAmt').value='';$('fdNote').value='';refresh()}
+    }).catch(function(){$('fdMsg').textContent='Could not reach the dashboard server.'})
+    .then(function(){$('fdAdd').disabled=false;$('fdWd').disabled=false})}
+$('fdAdd').addEventListener('click',function(){fdSend(1)});
+$('fdWd').addEventListener('click',function(){fdSend(-1)});
+
 /* ---------- page content ---------- */
 var S={sym:D.sel,pat:D.showPat},booted=false;
 var hbAge=D.hbAge;
 function render(){
-  $('upd').textContent=D.updated;
+  $('upd').textContent=D.updated;mxDraw();fdDraw();
   $('pillTxt').textContent=D.pill;$('pillDot').className='dot'+(D.live?'':' off');
   $('heroSub').innerHTML='Start <b class="num">'+IN(D.capital,0)+'</b> + added <b class="num">'+signed(D.funds,0)+'</b> + closed trades <b class="num '+cls(D.realizedAll)+'">'+signed(D.realizedAll)+'</b>. Open positions are marked to the last 5-minute close.';
   $('todaySub').innerHTML='realized '+money(D.realizedToday);
@@ -300,6 +377,7 @@ function render(){
   if(!SEEN&&!RM&&!booted){var t0=null;(function f(t){t0=t0||t;var k=Math.min((t-t0)/1400,1),e=1-Math.pow(1-k,3);$('bal').innerHTML=bigHTML(D.balance*e);if(k<1)requestAnimationFrame(f)})(performance.now())}
   else $('bal').innerHTML=bigHTML(D.balance);
 
+  $('cmeta').textContent=D.watchDay===D.today?'Live 5 min \u00b7 IST \u00b7 today':'Last session \u00b7 IST \u00b7 watching picks for '+D.watchDay;
   $('today-date').textContent='('+D.today+')';
   $('tradesBox').innerHTML=table(['Stock','Side','Qty','Entry','Stop','Target','Exit / now','Net Rs'],D.trades.map(function(t){
     return ['<b style="font-weight:600">'+esc(t.symbol)+'</b>',side(t.side),t.qty,IN(t.entry,2),t.stop==null?'':IN(t.stop,2),t.target==null?'':IN(t.target,2),
@@ -307,10 +385,21 @@ function render(){
   $('picksFor').textContent=D.picksDay?'for '+D.picksDay:'';
   $('picksBox').innerHTML=table(['#','Stock','Bias','Score','Use'],D.picks.map(function(p){
     return ['<span class="dim">'+p.rank+'</span>','<b style="font-weight:600">'+esc(p.symbol)+'</b>',side(p.bias),p.score.toFixed(2),'<span class="chip '+p.use+'">'+p.use+'</span>']}),[3]);
-  $('rep').textContent=D.report;
+  $('rep').textContent=D.report;mlDraw();
   var beat=document.querySelector('.beat');beat.className='beat'+(D.live?'':' off');
   beatTxt();
   tabs();
+}
+function mlDraw(){
+  var m=D.ml,box=$('mlBox'),h='<div class="mlrow"><span class="chip watching">Live trading uses: RULES '+esc(D.rule)+'</span>';
+  if(!m){$('mlDate').textContent='';box.innerHTML=h+'<span class="dim">No ML train result yet. Run: python main.py train</span></div>';return}
+  $('mlDate').textContent='(last train '+m.date+')';
+  h+='<span class="chip'+(m.on?' open':'')+'">ML gate: '+(m.on?'ON':'OFF')+' (report only)</span>';
+  h+='<span>Trade-scorer AUC <b class="num">'+m.auc.toFixed(3)+'</b> <span class="dim">(lower bound '+m.lo.toFixed(2)+'; 0.5 = no skill)</span></span>';
+  h+='<span>test trades <b class="num">'+m.nTest+'</b></span></div>';
+  if(m.hist.length>1)h+='<div class="mlrow">'+m.hist.map(function(x){return '<span class="chip'+(x.ok?' watching':'')+'">'+esc(x.date.slice(5))+' AUC '+x.auc.toFixed(3)+'</span>'}).join('')+'</div>';
+  h+='<p class="msub">'+(m.on?'The gate is ON, but live trading is not wired to it: trades still follow the rules. ':'')+(m.why.length?'Why not ML: '+esc(m.why.join('; '))+'. ':'')+'The ML models only report; they never place or filter trades.</p>';
+  box.innerHTML=h;
 }
 function beatTxt(){var m=$('hb');m.className='msg'+(D.live?'':' off');m.textContent=D.live?'SYSTEM LIVE - HB: '+pad(hbAge)+'s':D.beatMsg}
 function tabs(){
@@ -320,12 +409,26 @@ function tabs(){
 /* ---------- charts (one engine, many instances) ---------- */
 var CH=[],PADL=10,PADR=68,PADT=14,PADB=30,enc=encodeURIComponent;
 function Chart(host,sym,compact){
+  (function(){var b=BARS[sym];host.style.height='';var np=b?panels(b).length:0;if(np)host.style.height=(host.clientHeight+np*(compact?42:60))+'px'})();
   host.innerHTML='<canvas></canvas><canvas class="ov"></canvas><div class="tip"></div>';
   var cv=host.children[0],ov=host.children[1],tip=host.children[2],ctx=cv.getContext('2d'),octx=ov.getContext('2d');
   var W=0,H=0,DPR=1,geo={X:function(){return 0},T:0,B:0,step:1,L:0,n:0},me={sym:sym,prog:1,hover:-1},raf=0,hx=null,hraf=0,rz=0;
   function chip(x,y,txt,col){
     ctx.fillStyle=col;ctx.beginPath();ctx.roundRect(x,y-8,PADR-8,16,8);ctx.fill();
     ctx.fillStyle='#ffffff';ctx.font='500 10.5px Helvetica Neue Light, Helvetica, Arial, sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillText(txt,x+(PADR-8)/2,y+.5)}
+  function panel(k,top,h,b,shown,L,R){
+    var sp=IP[k],v=b.map(function(x){return x[sp.k]}),ok=v.filter(function(x){return x!=null}),th=k==='atr'?D.ind.minAtr:k==='rv'?D.ind.minRv:null,hi=100,i,first=true;
+    if(k!=='rsi')hi=Math.max(th*1.6,Math.max.apply(null,ok)*1.1);
+    var Yp=function(q){return top+h-q/hi*h};
+    ctx.save();ctx.strokeStyle=TH.grid;ctx.lineWidth=1;ctx.strokeRect(L+.5,top+.5,R-L-1,h-1);
+    if(k==='rsi'){[[D.ind.rsiL,'rgba(47,143,91,.13)'],[D.ind.rsiS,'rgba(196,80,63,.13)']].forEach(function(z){ctx.fillStyle=z[1];ctx.fillRect(L,Yp(z[0][1]),R-L,Yp(z[0][0])-Yp(z[0][1]))})}
+    if(th!=null){ctx.strokeStyle=TH.or;ctx.setLineDash([4,3]);ctx.beginPath();ctx.moveTo(L,Yp(th));ctx.lineTo(R,Yp(th));ctx.stroke();ctx.setLineDash([])}
+    if(k==='rv'){var bw=Math.max(1.5,geo.step*.62);for(i=0;i<shown;i++){if(v[i]==null)continue;ctx.fillStyle=v[i]>=th?'#2f8f5b':TH.neutral;ctx.globalAlpha=.8;ctx.fillRect(geo.X(i)-bw/2,Yp(v[i]),bw,top+h-Yp(v[i]))}ctx.globalAlpha=1}
+    else{ctx.strokeStyle='#3b6ea5';ctx.lineWidth=1.4;ctx.beginPath();for(i=0;i<shown;i++){if(v[i]==null)continue;first?ctx.moveTo(geo.X(i),Yp(v[i])):ctx.lineTo(geo.X(i),Yp(v[i]));first=false}ctx.stroke()}
+    ctx.fillStyle=TH.label;ctx.font='10px Helvetica Neue Light, Helvetica, Arial, sans-serif';ctx.textBaseline='top';ctx.textAlign='left';
+    ctx.fillText(sp.n+(th!=null?'  (engine min '+IN(th,k==='atr'?2:1)+')':'  (long 55-72, short 28-45)'),L+4,top+3);
+    if(ok.length){ctx.textBaseline='middle';ctx.fillText(IN(ok[ok.length-1],sp.d),R+8,top+h/2)}
+    ctx.restore()}
   me.size=function(){DPR=Math.min(window.devicePixelRatio||1,2);W=host.clientWidth;H=host.clientHeight;cv.width=W*DPR;cv.height=H*DPR;ov.width=W*DPR;ov.height=H*DPR;me.draw();me.drawOv()};
   me.drawOv=function(){octx.setTransform(DPR,0,0,DPR,0,0);octx.clearRect(0,0,W,H);
     if(me.hover>=0){var x=geo.X(me.hover);octx.strokeStyle=TH.cross;octx.lineWidth=1;octx.setLineDash([3,4]);octx.beginPath();octx.moveTo(x,geo.T);octx.lineTo(x,geo.B);octx.stroke();octx.setLineDash([])}};
@@ -334,12 +437,12 @@ function Chart(host,sym,compact){
     var b=BARS[sym];
     if(!b){ctx.fillStyle=TH.neutral;ctx.font='13px Helvetica Neue Light, Helvetica, Arial, sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';
       ctx.fillText('No bars available (market closed or fetch failed).',W/2,H/2);return}
-    var n=b.length,trs=D.trades.filter(function(t){return t.symbol===sym}),De=derived(sym),vw=De.vw,lo=Infinity,hi=-Infinity,i;
+    var n=b.length,PN=panels(b),ph=compact?36:54,pg=6,trs=D.trades.filter(function(t){return t.symbol===sym}),De=derived(sym),vw=De.vw,lo=Infinity,hi=-Infinity,i;
     b.forEach(function(x){lo=Math.min(lo,x.l);hi=Math.max(hi,x.h)});
     trs.forEach(function(t){[t.entry,t.stop,t.target].forEach(function(v){if(v!=null){lo=Math.min(lo,v);hi=Math.max(hi,v)}})});
     if(hi===lo){hi+=1;lo-=1}
     var pd=(hi-lo)*.09;lo-=pd;hi+=pd;
-    var slots=n+7,L=PADL,R=W-PADR,step=(R-L)/slots,T=PADT,B=H-PADB;
+    var slots=n+7,L=PADL,R=W-PADR,step=(R-L)/slots,T=PADT,B=H-PADB-PN.length*(ph+pg);
     var X=function(i){return L+(i+.5)*step},Y=function(v){return T+(hi-v)/(hi-lo)*(B-T)};
     geo={X:X,Y:Y,step:step,L:L,R:R,T:T,B:B,n:n};
     var dec=hi>1000?1:2,cy=[Y(b[n-1].c)];if(vw)cy.push(Y(vw[n-1]));
@@ -368,6 +471,7 @@ function Chart(host,sym,compact){
       ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=1.2;
       ctx.beginPath();ctx.moveTo(X(i),Y(x.h));ctx.lineTo(X(i),Y(x.l));ctx.stroke();
       ctx.fillRect(X(i)-cw/2,Y(Math.max(x.o,x.c)),cw,Math.max(1.5,Math.abs(Y(x.o)-Y(x.c))))}
+    PN.forEach(function(k,j){panel(k,B+pg+j*(ph+pg),ph,b,shown,L,R)});
     if(S.pat&&me.prog>=1){ctx.font='9px Helvetica Neue Light, Helvetica, Arial, sans-serif';ctx.textAlign='center';
       var lastLab=-9;
       De.pats.forEach(function(p){var x=b[p[0]],showLab=!compact&&p[0]-lastLab>3;if(showLab)lastLab=p[0];var c=p[2]==='bull'?'#2f8f5b':p[2]==='bear'?'#c4503f':TH.neutral,px=X(p[0]);
@@ -390,7 +494,7 @@ function Chart(host,sym,compact){
     if(i<0||i>=geo.n||me.prog<1){me.hoverOff();return}
     if(i===me.hover)return;
     me.hover=i;var x=BARS[sym][i],pt=derived(sym).pats.filter(function(p){return p[0]===i})[0];
-    tip.innerHTML='<b>'+tstr(sym,i)+'</b> IST<br>O '+IN(x.o,2)+' &nbsp;H '+IN(x.h,2)+'<br>L '+IN(x.l,2)+' &nbsp;C '+IN(x.c,2)+(x.v?'<br>Vol '+IN(x.v,0):'')+(S.pat&&pt?'<br><span style="color:#b8803f">'+pt[1]+'</span>':'');
+    tip.innerHTML='<b>'+tstr(sym,i)+'</b> IST<br>O '+IN(x.o,2)+' &nbsp;H '+IN(x.h,2)+'<br>L '+IN(x.l,2)+' &nbsp;C '+IN(x.c,2)+(x.v?'<br>Vol '+IN(x.v,0):'')+indTip(x)+(S.pat&&pt?'<br><span style="color:#b8803f">'+pt[1]+'</span>':'');
     var tx=geo.X(i)+14;if(tx+150>W)tx=geo.X(i)-150;tip.style.transform='translate('+tx+'px,8px)';tip.style.opacity=1;me.drawOv()}
   me.hoverOff=function(){hx=null;if(me.hover!==-1){me.hover=-1;tip.style.opacity=0;me.drawOv()}};
   ov.addEventListener('mousemove',function(e){hx=e.clientX-ov.getBoundingClientRect().left;if(!hraf)hraf=requestAnimationFrame(hoverFrame)});
@@ -404,8 +508,8 @@ function chgHTML(ch){return(ch>0?'+':'\u2212')+Math.abs(ch).toFixed(2)+'%'}
 function build(inPlace){
   var body=$('cbody'),P=S.pat?1:0,cs=$('chartSec');
   CH.forEach(function(c){c.destroy()});CH=[];
-  $('patBtn').style.display='';$('vseg').style.display='';document.querySelector('.legend').style.display='';
-  var grid=D.view==='grid'&&D.watch.length,WL=D.watch.slice(0,8);
+  $('patBtn').style.display='';$('iseg').style.display='';$('vseg').style.display='';document.querySelector('.legend').style.display='';
+  var grid=D.view==='grid'&&D.watch.length,WL=D.watch.slice(0,10);
   /* moving a node restarts its CSS entrance animation, so switch it off when moving after first paint */
   function put(before){if(cs.nextElementSibling===before)return;if(inPlace)cs.style.animation='none';before.parentNode.insertBefore(cs,before)}
   if(grid){
@@ -421,12 +525,16 @@ function build(inPlace){
     if(S.sym){body.innerHTML='<div class="cw" id="cw0"></div>';CH.push(Chart($('cw0'),S.sym,false));
       var inf=lastInfo(S.sym);$('symName').textContent=S.sym;
       if(inf){$('symPx').textContent=IN(inf.px,2);$('symChg').className='chg num '+cls(inf.ch);$('symChg').textContent=chgHTML(inf.ch)}}
-    else{body.innerHTML='<p class="dim">No watched stocks for today yet.</p>';$('symName').textContent='';$('patBtn').style.display='none';$('vseg').style.display='none';document.querySelector('.legend').style.display='none'}
+    else{body.innerHTML='<p class="dim">No watched stocks for today yet.</p>';$('symName').textContent='';$('patBtn').style.display='none';$('iseg').style.display='none';$('vseg').style.display='none';document.querySelector('.legend').style.display='none'}
   }
 }
 $('patBtn').addEventListener('click',function(){S.pat=!S.pat;this.setAttribute('aria-pressed',S.pat);this.textContent='patterns: '+(S.pat?'on':'off');
   try{history.replaceState(null,'','?s='+enc(S.sym||'')+'&p='+(S.pat?1:0)+'&v='+D.view)}catch(e){}
   tabs();viewLinks();CH.forEach(function(c){c.draw();c.hoverOff()})});
+
+[].forEach.call(document.querySelectorAll('.ibtn'),function(el){var k=el.dataset.k;el.setAttribute('aria-pressed',indOn(k));
+  el.addEventListener('click',function(){IND[k]=!indOn(k);el.setAttribute('aria-pressed',IND[k]);try{localStorage.setItem('nseind',JSON.stringify(IND))}catch(e){}
+    build(true);requestAnimationFrame(function(){CH.forEach(function(c){c.size()})})})});
 
 /* ---------- in-place navigation: tabs, Single / All charts and mini-chart titles swap only the chart section ---------- */
 var navSeq=0,want={sym:S.sym,view:D.view};
@@ -523,10 +631,11 @@ TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
         <div class="chart-head">
           <div>
             <div class="sym"><span id="symName"></span><span class="px num" id="symPx"></span><span class="chg num" id="symChg"></span></div>
-            <div class="meta">Live 5 min &middot; IST &middot; today</div>
+            <div class="meta" id="cmeta">Live 5 min &middot; IST &middot; today</div>
           </div>
           <div class="ctl">
             <div class="seg" id="vseg"><a id="vSingle" href="?v=single" aria-pressed="true">Single</a><a id="vGrid" href="?v=grid" aria-pressed="false">All charts</a></div>
+            <span id="iseg" aria-label="Indicator panels"><button class="btn ibtn" data-k="rsi" type="button" aria-pressed="true">RSI</button><button class="btn ibtn" data-k="atr" type="button" aria-pressed="true">ATR</button><button class="btn ibtn" data-k="rv" type="button" aria-pressed="true">Rel vol</button></span>
             <button class="btn" id="patBtn" aria-pressed="true">patterns: on</button>
           </div>
         </div>
@@ -537,6 +646,7 @@ TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
           <span><i style="border-color:#3b6ea5"></i>Entry</span>
           <span><i style="border-color:#c4503f"></i>Stop</span>
           <span><i style="border-color:#2f8f5b"></i>Target</span>
+         
           <span class="dim">Charts are display only. Patterns are not used by the trading rules.</span>
         </div>
       </section>
@@ -554,9 +664,37 @@ TEMPLATE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
           <div><div class="msg" id="hb"></div><div class="sub">Heartbeat file refreshed every 5 min. Idle after 7.</div></div>
         </div>
       </section>
+      <section class="glass rise" id="maxSec" aria-label="Max trades per day">
+        <h2>Max trades per day</h2>
+        <div class="maxrow">
+          <div class="step" role="group" aria-label="Max trades per day">
+            <button class="btn" id="mxDown" type="button" aria-label="Fewer trades">&minus;</button>
+            <span class="num maxval" id="mxVal" aria-live="polite"></span>
+            <button class="btn" id="mxUp" type="button" aria-label="More trades">+</button>
+          </div>
+          <button class="btn" id="mxSave" type="button" aria-pressed="true">Apply</button>
+        </div>
+        <p class="msub" id="mxSub"></p>
+        <p class="msub" id="mxMsg" role="status"></p>
+      </section>
+      <section class="glass rise" id="fundSec" aria-label="Account funds">
+        <h2>Account funds</h2>
+        <div class="fundrow">
+          <input class="fin num" id="fdAmt" type="number" min="1" step="any" inputmode="decimal" placeholder="Amount (Rs)" aria-label="Amount in rupees">
+          <input class="fin" id="fdNote" type="text" maxlength="80" placeholder="Note (optional)" aria-label="Note">
+        </div>
+        <div class="fundrow">
+          <button class="btn" id="fdAdd" type="button">Add money</button>
+          <button class="btn" id="fdWd" type="button">Withdraw</button>
+        </div>
+        <p class="msub" id="fdSub"></p>
+        <p class="msub" id="fdMsg" role="status"></p>
+        <div id="fdBox"></div>
+      </section>
       <section class="glass rise"><h2>Top picks <i id="picksFor"></i></h2><div id="picksBox"></div></section>
     </div>
   </div>
+  <section class="glass full rise" id="mlSec"><h2>Strategy in use <i id="mlDate"></i></h2><div id="mlBox"></div></section>
   <section class="glass full rise"><h2>Readiness</h2><pre id="rep"></pre></section>
 </div>
 <script>window.__D=%%DATA%%;</script>
@@ -652,7 +790,7 @@ function head(){
 
 function watchHTML(){
   if(!D.watch.length)return '<p class="dim">No watched stocks for today yet.</p>';
-  return D.watch.slice(0,8).map(function(s){
+  return D.watch.slice(0,10).map(function(s){
     var b=D.bars[s],open=D.trades.some(function(t){return t.symbol===s&&t.status==='open'}),px=null,ch=null;
     if(b&&b.c.length){px=b.c[b.c.length-1];ch=(px/b.o[0]-1)*100}
     return '<div class="wrow"><div class="wsym"><b>'+esc(s)+'</b>'+(open?'<i class="od" title="open trade"></i>':'')+'</div>'+
@@ -754,8 +892,12 @@ def bars_payload(df):
         return None
     idx = _naive_index(df)
     vol = df.volume if "volume" in df else [0] * len(df)
-    return {"t": [x.strftime("%H:%M") for x in idx], "o": r2(df.open), "h": r2(df.high), "l": r2(df.low),
-            "c": r2(df.close), "v": [int(v) if v == v else 0 for v in vol]}
+    out = {"t": [x.strftime("%H:%M") for x in idx], "o": r2(df.open), "h": r2(df.high), "l": r2(df.low),
+           "c": r2(df.close), "v": [int(v) if v == v else 0 for v in vol]}
+    if "atr" in df:                                              # engine indicators; None while still warming up
+        col = lambda ser, d: [None if v != v else round(float(v), d) for v in ser]
+        out.update(a=col(df.atr / df.close * 100, 3), r=col(df.rsi, 1), q=col(df.relvol, 2))
+    return out
 
 
 def bar_index(df, ts):
@@ -769,27 +911,52 @@ def bar_index(df, ts):
         return None
 
 
+def _max_info():
+    """Max-trades fields for the page: current value, why it is locked (or None), allowed range. None value hides the card."""
+    try:
+        return {"maxTrades": limits.current(), "maxLock": limits.lock_reason(), "maxRange": [limits.LOW, limits.HIGH]}
+    except Exception:
+        return {"maxTrades": None, "maxLock": None, "maxRange": [limits.LOW, limits.HIGH]}
+
+
+def _ml_info():
+    """Latest ML train result and gate state from data/ml_gate.json (written by ml.update_gate); None until `train` has run."""
+    try:
+        h = json.load(open("data/ml_gate.json"))
+        last = h["history"][-1]
+        return {"on": bool(h.get("on")), "auc": last["auc"], "lo": last["lo"], "nTest": last["n_test"], "date": last["date"],
+                "why": last.get("why", []),
+                "hist": [{"date": x["date"], "auc": x["auc"], "ok": x["passed"]} for x in h["history"][-6:]]}
+    except Exception:
+        return None
+
+
 def payload(cfg, qs=None):
     qs = qs or {}
     c = db.connect()
     today = str(date.today())
     realized_all, funds = db.realized(c), db.funds(c)
+    ledger = sorted(({"effective": str(r["effective"]), "amount": float(r["amount"]), "note": r["note"] or "",
+                      "pending": str(r["effective"]) > today} for r in db.ledger_rows(c)),
+                    key=lambda r: r["effective"], reverse=True)[:100]
     day = sorted(db.day_trades(c, today), key=lambda x: x["entry_time"])
     n = cfg["picks_per_night"]
 
-    # stocks to chart: today's traded symbols first, then today's watched picks
+    # stocks to chart: once the evening run has saved picks for a later day, those; else today's traded symbols, then today's picks
+    nxt = c.execute("SELECT MAX(day) FROM picks").fetchone()[0]
+    wday = str(nxt) if nxt and str(nxt) > today else today
     watch = []
-    for t in day:
+    for t in (day if wday == today else []):
         if t["symbol"] not in watch:
             watch.append(t["symbol"])
-    for r in c.execute("SELECT symbol FROM picks WHERE day=? ORDER BY rank LIMIT ?", (today, n)).fetchall():
+    for r in c.execute("SELECT symbol FROM picks WHERE day=? ORDER BY rank LIMIT ?", (wday, n)).fetchall():
         if r["symbol"] not in watch:
             watch.append(r["symbol"])
     sel = qs.get("s", [None])[0]
     sel = sel if sel in watch else (watch[0] if watch else None)
     show_pat = qs.get("p", ["1"])[0] != "0"
     grid = qs.get("v", ["single"])[0] == "grid"
-    chart_syms = (watch[:8] if grid else [sel]) if watch else []      # grid view charts every watched stock (max 8)
+    chart_syms = (watch[:10] if grid else [sel]) if watch else []      # grid view charts every watched stock (max 10)
     dfs = fetch_all_bars(chart_syms)
 
     trades, realized_today, unreal, unreal_ok, n_open, wins, n_closed = [], 0.0, 0.0, True, 0, 0, 0
@@ -824,7 +991,6 @@ def payload(cfg, qs=None):
     else:
         pill, beat_msg = "live engine has not run yet", "ENGINE NOT RUN YET"
 
-    nxt = c.execute("SELECT MAX(day) FROM picks").fetchone()[0]
     picks = c.execute("SELECT symbol, rank, score, bias FROM picks WHERE day=? ORDER BY rank", (nxt,)).fetchall() if nxt else []
     rep = report.render(report.stats(db.closed_trades(c, cfg["rule_version"]), cfg), cfg)
 
@@ -838,16 +1004,19 @@ def payload(cfg, qs=None):
     return {
         "capital": cfg["capital"], "funds": funds, "realizedAll": realized_all,
         "balance": cfg["capital"] + funds + realized_all,
+        "ledger": ledger, "fundsPending": sum(r["amount"] for r in ledger if r["pending"]),
         "today": today, "rule": str(cfg["rule_version"]), "updated": f"{datetime.now():%d %b %H:%M:%S}",
         "live": live_on, "pill": pill, "beatMsg": beat_msg, "hbAge": int(age) if live_on else None,
         "realizedToday": realized_today, "unreal": unreal if unreal_ok else None, "total": total if unreal_ok else None,
         "nOpen": n_open, "nClosed": n_closed, "wins": int(wins), "trades": trades,
-        "watch": watch, "sel": sel, "showPat": show_pat, "chg": chg, "orBars": int(cfg.get("or_bars", 3)),
+        "watch": watch, "watchDay": wday, "sel": sel,
+        "ind": {"minAtr": cfg["min_atr_pct"] * 100, "minRv": cfg["min_relvol"], "rsiL": [55, 72], "rsiS": [28, 45]},
+        "showPat": show_pat, "chg": chg, "orBars": int(cfg.get("or_bars", 3)),
         "view": "grid" if grid else "single", "bars": {s: bars_payload(df) for s, df in dfs.items()},
         "picksDay": str(nxt) if nxt else "",
         "picks": [{"rank": p["rank"], "symbol": p["symbol"], "bias": "LONG" if p["bias"] > 0 else "SHORT",
                    "score": float(p["score"]), "use": "watching" if p["rank"] <= n else "extra"} for p in picks],
-        "report": rep, "photo": False,
+        "report": rep, "photo": False, "ml": _ml_info(), **_max_info(),
     }
 
 
@@ -859,6 +1028,51 @@ def page(cfg, qs=None):
 
 def make_server(cfg, port=8765):
     class H(BaseHTTPRequestHandler):
+        def _json(self, code, obj):
+            body = json.dumps(obj, default=str).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _fund(self):
+            """POST /fund {"amount": 5000, "note": "..."} (negative amount = withdraw), then rebuild the next picks."""
+            try:
+                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 2048)))
+                amount, note = body["amount"], body.get("note", "")
+            except Exception:
+                return self._json(400, {"ok": False, "msg": "Send an amount and an optional note."})
+            ok, msg, eff = acct.add(cfg, amount, note)
+            if ok:
+                try:
+                    msg += " " + acct.repick(cfg, eff)
+                except Exception as e:
+                    msg += f" The picks were not rebuilt ({e}); the evening run will use the new balance."
+            self._json(200, {"ok": ok, "msg": msg})
+
+        def do_POST(self):
+            """POST /maxtrades {"n": 3} or /fund {...}. Only this page may call them: custom header, Host and Origin must all be local."""
+            hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+            origin = self.headers.get("Origin")
+            path = urlparse(self.path).path
+            if (path not in ("/maxtrades", "/fund") or self.headers.get("X-NSE") != "1"
+                    or self.headers.get("Host") not in hosts or (origin is not None and origin not in {f"http://{h}" for h in hosts})):
+                return self._json(403, {"ok": False, "msg": "Refused."})
+            if path == "/fund":
+                return self._fund()
+            try:
+                n = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 1024)))["n"]
+                if type(n) is not int:
+                    raise ValueError
+            except Exception:
+                return self._json(400, {"ok": False, "msg": f"Send a whole number from {limits.LOW} to {limits.HIGH}.", **_max_info()})
+            ok, msg, _, new = limits.set_max_trades(n)
+            if ok:
+                cfg["max_trades_per_day"] = new
+            self._json(200, {"ok": ok, "msg": msg, **_max_info()})
+
         def do_GET(self):
             t0 = time.time()
             u = urlparse(self.path)
@@ -903,6 +1117,24 @@ def widget_page(cfg):
             .replace("%%VIDEO%%", VIDEO).replace("%%VIDEOJS%%", VIDEO_JS).replace("%%WJS%%", WJS).replace("%%DATA%%", blob))
 
 
+POS_FILE = "widget_pos.json"
+
+
+def _saved_pos():
+    """Last saved window position, or (None, None) if there is none or it is off every screen now (monitor unplugged)."""
+    try:
+        import ctypes
+        with open(POS_FILE) as f:
+            d = json.load(f)
+        x, y = int(d["x"]), int(d["y"])
+        g = ctypes.windll.user32.GetSystemMetrics                # virtual desktop: 76/77 origin, 78/79 size
+        if g(76) <= x < g(76) + g(78) - 60 and g(77) <= y < g(77) + g(79) - 60:
+            return x, y
+    except Exception:
+        pass
+    return None, None
+
+
 class _WidgetApi:
     """Exposed to the page as pywebview.api. The window is frameless, so close, pin and drag are done here with plain
     Win32 calls (pywebview's own setters/easy_drag misbehave when called from the page's worker thread).
@@ -919,7 +1151,16 @@ class _WidgetApi:
         u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
         return u, u.FindWindowW(None, "NSE Widget"), wintypes
 
+    def _save_pos(self):                                         # remember where the window is, so it reopens there
+        import ctypes
+        u, hwnd, wt = self._win()
+        r = wt.RECT()
+        if hwnd and u.GetWindowRect(hwnd, ctypes.byref(r)):
+            with open(POS_FILE, "w") as f:
+                json.dump({"x": r.left, "y": r.top}, f)
+
     def close(self):
+        self._save_pos()
         import webview
         for w in list(webview.windows):
             w.destroy()
@@ -935,6 +1176,8 @@ class _WidgetApi:
 
     def toggle_top(self):                                        # _top now means "pinned"
         self._top = not self._top
+        if self._top:                                            # just pinned: this is where the user wants it
+            self._save_pos()
         return self._apply()
 
     _hid = False
@@ -997,6 +1240,7 @@ def widget(cfg, port=8765, width=380, height=620):
         while True:                                              # keep the server thread alive
             time.sleep(3600)
         return
-    webview.create_window("NSE Widget", url, width=width, height=height, frameless=True, easy_drag=False, on_top=False,
+    x, y = _saved_pos()
+    webview.create_window("NSE Widget", url, width=width, height=height, x=x, y=y, frameless=True, easy_drag=False, on_top=False,
                           resizable=False, js_api=_WidgetApi(), background_color="#0d1710")
     webview.start(private_mode=False)                            # private_mode off so the theme choice is remembered
